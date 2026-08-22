@@ -4,6 +4,7 @@
 //! 创建挂起进程 → 注入 GameAssembly.dll → 定位 il2cpp 节 → pattern scan 写入值 2
 //! → 恢复主线程。所有注入写入发生在游戏代码启动之前
 
+mod admin;
 mod cli;
 mod config;
 mod inject;
@@ -42,6 +43,12 @@ fn init_logger(verbose: bool) {
 }
 
 fn run(args: &cli::Args) -> Result<()> {
+    // 0. 管理员权限保障：非管理员时通过 UAC 以管理员身份重启自身并退出。
+    //    注入与内存写操作需要目标进程权限 ≤ 启动器，若游戏以管理员权限运行，
+    //    启动器必须以管理员身份执行，否则禁用。
+    //    提权在解析 CLI（含 --game-path）之后进行，确保参数透传正确。
+    admin::ensure_admin(&admin::current_exe()?, &admin::raw_args())?;
+
     // 1. 加载配置
     let config_path = args
         .config

@@ -10,7 +10,7 @@ cargo build --release  # Release
 cargo run -- --game-path "E:\...\StarRail.exe"
 ```
 
-运行时需管理员权限（`CreateProcessW` 注入）。游戏必须由本工具启动，不能手动启动后附加。
+运行时需管理员权限（`CreateProcessW` 注入），但**不要求**由工具强制提权：`src/admin.rs` 在流程最前检测 `IsUserAnAdmin`，非管理员时用 `ShellExecuteExW` + `runas` 通过 UAC 以管理员身份重启自身（透传原始参数）并退出当前进程。游戏必须由本工具启动，不能手动启动后附加。
 
 ## CI 与版本号
 
@@ -20,7 +20,8 @@ cargo run -- --game-path "E:\...\StarRail.exe"
 
 ## 架构
 
-- `src/main.rs` — 入口流程：初始化日志（env_logger，`-v` 开 Debug）→ 解析 CLI → 加载配置 → 解析游戏路径（CLI > 配置文件 > 注册表）→ 检测游戏进程并询问清理 → 创建挂起进程 → 注入 DLL → goblin 解析 PE 头 → 找 il2cpp 节 → pattern scan 写值 → 恢复线程
+- `src/main.rs` — 入口流程：初始化日志（env_logger，`-v` 开 Debug）→ 解析 CLI → 管理员提权保障（`admin::ensure_admin`）→ 加载配置 → 解析游戏路径（CLI > 配置文件 > 注册表）→ 检测游戏进程并询问清理 → 创建挂起进程 → 注入 DLL → goblin 解析 PE 头 → 找 il2cpp 节 → pattern scan 写值 → 恢复线程
+- `src/admin.rs` — 管理员权限检测与自动提权：`is_admin`（`IsUserAnAdmin`）、`ensure_admin`（非管理员时 `ShellExecuteExW` + `runas` 以管理员身份重启自身并退出）、`rebuild_command_line`（按 `CommandLineToArgvW` 规则重建参数，含空格路径会加引号，避免提权重启时拆坏 `--game-path`）
 - `src/cli.rs` — clap 参数：`--game-path` / `--config` / `-v`（注意：`--game-path` 命中后会自动回写配置文件）
 - `src/config.rs` — TOML 配置读写（serde + toml）；注册表回退用 **winreg** 查找 `HKEY_CURRENT_USER\Software\miHoYo\HYP\1_?\hkrpg_cn\GameInstallPath`（CN 优先）与 `Software\Cognosphere\HYP\1_?\hkrpg_global`（Global）
 - `src/inject.rs` — AOB pattern scan（`??` 通配符，memchr 加速首字节，见 `scan_pattern`）；`AobPattern` 结构体数组 `MOBILE_UI_PATTERNS` 按顺序匹配并写入值 2
@@ -30,7 +31,7 @@ cargo run -- --game-path "E:\...\StarRail.exe"
 ## 沿用约定与踩坑记录
 
 1. **游戏版本更新 = pattern 失效**：AOB 签名随游戏二进制变化，"所有 UI pattern 均未匹配"时优先检查/更新 `inject.rs` 的 `MOBILE_UI_PATTERNS`（顺序最新→最旧；`rel32_offset` 指向 `C7 05` 后的 rel32 位置，改动需与 RIP 相对寻址计算联动，当前 target = base + rva + pos + offset + 4）
-2. **windows-sys 是 feature 门控**：用到某个 Win32 API 时，必须同步向 Cargo.toml 的 `windows-sys` features 追加对应 feature（如 `Win32_System_Threading`），否则编译报 unresolved import；当前保留实际用到的 6 个 feature（Foundation / Diagnostics_Debug / LibraryLoader / Memory / ProcessStatus / Threading）
+2. **windows-sys 是 feature 门控**：用到某个 Win32 API 时，必须同步向 Cargo.toml 的 `windows-sys` features 追加对应 feature（如 `Win32_System_Threading`），否则编译报 unresolved import；当前保留实际用到的 9 个 feature（Foundation / Diagnostics_Debug / LibraryLoader / Memory / ProcessStatus / Threading / Registry / UI_Shell / UI_WindowsAndMessaging）。注意：`ShellExecuteExW` 与 `SHELLEXECUTEINFOW` 除 `Win32_UI_Shell` 外还需 `Win32_System_Registry`，`SW_SHOWNORMAL` 需要 `Win32_UI_WindowsAndMessaging`
 3. **`hksr-mobile.toml` 被 .gitignore**：它是本地配置（含本机游戏路径），不应提交；配置不存在时用默认值，程序会自动创建
 4. **Rust 依赖一律通过 `cargo add` 添加**，禁止手写 Cargo.toml 的 `[dependencies]`；PE 解析用 goblin、注册表用 winreg、日志用 log + env_logger、shellcode 用 iced-x86，不重复造轮子
 5. **风格**：源码注释与运行输出用中文；输出统一走 `log` crate（info 流程 / warn 警告 / error 错误 / debug 诊断），仅交互询问用 `println!`/`read_line`；edition 2024，`cargo fmt` + `cargo clippy` 保持零警告

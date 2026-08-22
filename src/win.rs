@@ -335,6 +335,6 @@ fn utf16_bytes(s: &str) -> Vec<u8> {
 }
 
 /// 将 `&str` 转为 null 结尾的 UTF-16 `Vec<u16>`
-fn to_wide_string(s: &str) -> Vec<u16> {
+pub(crate) fn to_wide_string(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

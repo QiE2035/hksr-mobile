@@ -6,12 +6,13 @@ Windows 版崩坏：星穹铁道 MobileUI 启动器。以挂起状态创建游�
 
 ## 工作原理
 
-1. 检测与配置路径匹配的游戏进程，若存在（含上次被强杀残留的挂起进程）则询问是否终止
-2. `CreateProcessW` 以挂起状态（`CREATE_SUSPENDED`）启动游戏
-3. 注入 GameAssembly.dll：iced-x86 生成 shellcode 执行 `kernel32!LoadLibraryW` 并回写 64 位基址，由公开 API `CreateRemoteThread` 驱动（无 syscall 桩、无手写机器码）
-4. 解析 PE 头，定位 il2cpp 节
-5. 在 il2cpp 节内 pattern scan 定位 MobileUI 开关地址，写入值 `2`
-6. 恢复主线程，游戏正常启动且 MobileUI 已启用；出错时自动终止挂起进程清理
+1. 检测当前是否以管理员身份运行，非管理员时通过 UAC 自动提权重启
+2. 检测与配置路径匹配的游戏进程，若存在（含上次被强杀残留的挂起进程）则询问是否终止
+3. `CreateProcessW` 以挂起状态（`CREATE_SUSPENDED`）启动游戏
+4. 注入 GameAssembly.dll：iced-x86 生成 shellcode 执行 `kernel32!LoadLibraryW` 并回写 64 位基址，由公开 API `CreateRemoteThread` 驱动（无 syscall 桩、无手写机器码）
+5. 解析 PE 头，定位 il2cpp 节
+6. 在 il2cpp 节内 pattern scan 定位 MobileUI 开关地址，写入值 `2`
+7. 恢复主线程，游戏正常启动且 MobileUI 已启用；出错时自动终止挂起进程清理
 
 ## 构建
 
@@ -32,7 +33,7 @@ cargo build --release  # Release
 
 ## 使用
 
-游戏必须由本工具启动（不支持手动启动后附加），运行需管理员权限。
+游戏必须由本工具启动（不支持手动启动后附加）。运行需管理员权限：若以普通权限启动，本工具会通过 UAC 弹窗申请提权并以管理员身份自动重启自身（透传原参数），然后继续执行。
 
 ```
 hksr-mobile.exe --game-path "E:\...\StarRail.exe"
