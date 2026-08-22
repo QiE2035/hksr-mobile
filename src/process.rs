@@ -1,6 +1,6 @@
 //! 游戏进程检测与终止
 //!
-//! 用途：解锁器启动前检测已存在的 StarRail 进程并询问是否终止。
+//! 用途：解锁器启动前检测与配置游戏路径匹配的进程并询问是否终止。
 //! 覆盖场景：上次运行被强杀（Ctrl+C / taskkill）残留的挂起进程，
 //! 以及用户手动打开的游戏实例（终止前需要用户确认）。
 
@@ -15,8 +15,8 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::win::OwnedHandle;
 
-/// 查找当前所有 StarRail.exe 进程的 PID
-pub fn find_game_processes() -> Result<Vec<u32>> {
+/// 查找与配置游戏路径匹配的所有进程 PID
+pub fn find_game_processes(game_path: &Path) -> Result<Vec<u32>> {
     // 一次性查询全部进程 PID（数组不够时按返回值截断，Windows 下足够容纳）
     let mut pids = vec![0u32; 4096];
     let mut needed = 0u32;
@@ -27,21 +27,21 @@ pub fn find_game_processes() -> Result<Vec<u32>> {
 
     let mut found = Vec::new();
     for &pid in &pids {
-        if pid != 0 && is_starrail(pid) {
+        if pid != 0 && is_matching_process(pid, game_path) {
             found.push(pid);
         }
     }
     Ok(found)
 }
 
-/// 检测现有游戏进程并询问是否终止全部；确认后逐一终止
+/// 检测匹配的游戏进程并询问是否终止全部；确认后逐一终止
 ///
 /// 上次启动被强杀可能残留挂起的游戏进程，阻塞后续正常运行；
 /// 正常运行的游戏实例终止前也需要用户确认。直接回车 = 全部终止。
-pub fn prompt_kill_game_processes() -> Result<()> {
+pub fn prompt_kill_game_processes(game_path: &Path) -> Result<()> {
     use std::io::Write;
 
-    let pids = find_game_processes()?;
+    let pids = find_game_processes(game_path)?;
     if pids.is_empty() {
         return Ok(());
     }
@@ -51,8 +51,8 @@ pub fn prompt_kill_game_processes() -> Result<()> {
         .map(|p| p.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    println!("检测到 {} 个 StarRail 进程 (PID: {})", pids.len(), pid_list);
-    print!("是否终止全部 StarRail 进程?[Y/n] ");
+    println!("检测到 {} 个游戏进程 (PID: {})", pids.len(), pid_list);
+    print!("是否终止全部游戏进程?[Y/n] ");
     std::io::stdout().flush().ok();
 
     let mut input = String::new();
@@ -61,7 +61,7 @@ pub fn prompt_kill_game_processes() -> Result<()> {
     if answer.is_empty() || answer.starts_with('y') {
         for pid in &pids {
             if terminate(*pid) {
-                info!("已终止残留游戏进程 (PID: {})", pid);
+                info!("已终止游戏进程 (PID: {})", pid);
             } else {
                 info!("终止失败 (PID: {})", pid);
             }
@@ -70,8 +70,8 @@ pub fn prompt_kill_game_processes() -> Result<()> {
     Ok(())
 }
 
-/// 判断 PID 是否为 StarRail.exe（对比可执行文件名，防御 PID 复用）
-fn is_starrail(pid: u32) -> bool {
+/// 判断 PID 进程的完整路径是否与配置的游戏路径一致（大小写不敏感，防御 PID 复用）
+fn is_matching_process(pid: u32, game_path: &Path) -> bool {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return false;
@@ -84,10 +84,7 @@ fn is_starrail(pid: u32) -> bool {
         return false;
     }
     let exe_path = String::from_utf16_lossy(&buf[..len as usize]);
-    Path::new(&exe_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("StarRail.exe"))
+    exe_path.eq_ignore_ascii_case(&game_path.to_string_lossy())
 }
 
 /// 强制终止指定 PID 的进程
