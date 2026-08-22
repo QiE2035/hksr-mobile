@@ -11,4 +11,8 @@ pub struct Args {
     /// 指定配置文件路径（可选，缺省与 exe 同目录）
     #[arg(short, long)]
     pub config: Option<PathBuf>,
+
+    /// 显示调试日志（ntdll 解析等诊断信息）
+    #[arg(short, long)]
+    pub verbose: bool,
 }

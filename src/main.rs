@@ -1,24 +1,43 @@
+//! 崩坏：星穹铁道 MobileUI 启动器
+//!
+//! 流程：解析 CLI → 加载配置 → 解析游戏路径（CLI > 配置文件 > 注册表）→
+//! 创建挂起进程 → 注入 GameAssembly.dll → 定位 il2cpp 节 → pattern scan 写入值 2
+//! → 恢复主线程。所有注入写入发生在游戏代码启动之前
+
 mod cli;
 mod config;
 mod inject;
-mod pe;
 mod win;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use log::{error, info, warn};
 use std::path::PathBuf;
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("Error: {}", e);
-        // 错误退出时清理挂起的进程由 run() 内部的 guard 处理
+    let args = cli::Args::parse();
+    init_logger(args.verbose);
+
+    if let Err(e) = run(&args) {
+        error!("{:#}", e);
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
-    let args = cli::Args::parse();
+/// 初始化日志：默认 Info 级别，`-v` 开启 Debug（显示 ntdll 解析等诊断信息）
+fn init_logger(verbose: bool) {
+    env_logger::Builder::new()
+        .filter_level(if verbose {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        })
+        .format_timestamp(None)
+        .format_target(false)
+        .init();
+}
 
+fn run(args: &cli::Args) -> Result<()> {
     // 1. 加载配置
     let config_path = args
         .config
@@ -28,74 +47,74 @@ fn run() -> Result<()> {
         .with_context(|| format!("加载配置失败: {}", config_path.display()))?;
 
     // 2. 解析游戏路径：CLI > 配置文件 > 注册表
-    let game_path = resolve_game_path(&args, &mut cfg, &config_path)?;
+    let game_path = resolve_game_path(args, &mut cfg, &config_path)?;
+    info!("游戏路径: {}", game_path.display());
 
-    println!("[*] 游戏路径: {}", game_path.display());
+    // 3. 创建挂起进程（RAII：出错自动终止，防止残留挂起的游戏进程）
+    info!("启动游戏进程（挂起）...");
+    let mut process = win::SuspendedProcess::create(&game_path)?;
+    info!("进程已创建 (PID: {})", process.pid());
+    let handle = process.handle();
 
-    // 3. 创建挂起的进程（失败时自动清理）
-    println!("[*] 启动游戏进程（挂起）...");
-    let (process, _thread, pid) = win::create_process_suspended(&game_path)?;
-    let mut _guard = ProcessGuard::new(process.0);
-    println!("[+] 进程已创建 (PID: {})", pid);
-
-    // 4. 在挂起的进程中注入 GameAssembly.dll（CreateRemoteThread + LoadLibraryW）
-    //    这样注入完成后主线程尚未执行，写入发生在 game 代码启动之前
+    // 4. 注入 GameAssembly.dll（主线程尚未执行，写入发生在游戏代码启动之前）
     let game_dir = game_path.parent().context("无法获取游戏目录")?;
     let ga_dll_path = game_dir.join("GameAssembly.dll");
-    println!("[*] 注入 {}...", ga_dll_path.display());
-    let ga_base = win::inject_dll(process.0, ga_dll_path.to_str().context("路径无效")?)?;
-    println!("[+] GameAssembly.dll 基地址: 0x{:X}", ga_base);
+    info!("注入 {}...", ga_dll_path.display());
+    let ga_base = win::inject_dll(handle, ga_dll_path.to_str().context("路径无效")?)?;
 
-    // 5. 解析 PE 头
-    println!("[*] 解析 PE 头...");
-    let pe_header = win::read_process_memory(process.0, ga_base, 0x1000)?;
-    let pe = pe::parse(&pe_header)?;
-    println!(
-        "[+] SizeOfImage: 0x{:X}, {} 个节区",
-        pe.size_of_image,
+    // 5. 解析 PE 头，定位 il2cpp 节
+    info!("解析 PE 头...");
+    let header = win::read_process_memory(handle, ga_base, 0x1000)?;
+    let pe = goblin::pe::PE::parse(&header).context("解析 PE 头失败")?;
+    let size_of_image = pe
+        .header
+        .optional_header
+        .as_ref()
+        .context("PE 头缺少 OptionalHeader")?
+        .windows_fields
+        .size_of_image as usize;
+    info!(
+        "SizeOfImage: 0x{:X}, {} 个节区",
+        size_of_image,
         pe.sections.len()
     );
 
-    // 6. 读取完整镜像
-    let pe_full = win::read_process_memory(process.0, ga_base, pe.size_of_image)?;
-
-    // 7. 查找 il2cpp 节
+    // 6. 读取完整镜像并截取 il2cpp 节数据
+    let image = win::read_process_memory(handle, ga_base, size_of_image)?;
     let il2cpp = pe
         .sections
         .iter()
-        .find(|s| s.name_str() == "il2cpp" || s.name_str() == ".il2cpp")
+        .find(|s| &s.name[..] == b"il2cpp" || &s.name[..] == b".il2cpp")
         .context("未找到 il2cpp 节区")?;
 
-    println!("[+] il2cpp 节: {}", il2cpp);
-
-    // 8. 截取 il2cpp 节数据
-    let il2cpp_end = il2cpp.rva + il2cpp.virtual_size;
-    if il2cpp_end > pe_full.len() {
+    let rva = il2cpp.virtual_address as usize;
+    let size = il2cpp.virtual_size as usize;
+    if rva + size > image.len() {
         bail!("il2cpp 节超出读取范围");
     }
-    let il2cpp_data = &pe_full[il2cpp.rva..il2cpp_end];
-    println!("[+] 读取 il2cpp 节: {} 字节", il2cpp_data.len());
+    info!("il2cpp 节: RVA=0x{:X}, size=0x{:X}", rva, size);
+    let il2cpp_data = &image[rva..rva + size];
 
-    // 9. pattern scan + 写入值 2
-    inject::enable_mobile_ui(process.0, ga_base, il2cpp.rva as u32, il2cpp_data)?;
+    // 7. pattern scan + 写入值 2（启用 MobileUI）
+    inject::enable_mobile_ui(handle, ga_base, rva as u32, il2cpp_data)?;
 
-    // 10. 恢复主线程
-    println!("[*] 恢复游戏进程...");
-    win::resume_thread(_thread.0)?;
-    _guard.suppress();
-    println!("[+] 游戏已启动，MobileUI 已启用！");
-
+    // 8. 恢复主线程，游戏正常启动
+    info!("恢复游戏进程...");
+    process.resume()?;
+    info!("游戏已启动，MobileUI 已启用！");
     Ok(())
 }
 
-/// 解析游戏路径：CLI > 配置 > 注册表
+/// 解析游戏路径，优先级：CLI 参数 > 配置文件 > 注册表
+///
+/// CLI 参数与注册表命中后自动回写配置文件（失败不阻断流程）
 fn resolve_game_path(
     args: &cli::Args,
     cfg: &mut config::Config,
     config_path: &std::path::Path,
 ) -> Result<PathBuf> {
     // CLI 参数优先
-    if let Some(ref p) = args.game_path {
+    if let Some(p) = &args.game_path {
         if p.exists() {
             cfg.game_path = Some(p.clone());
             cfg.save(config_path).ok();
@@ -105,50 +124,21 @@ fn resolve_game_path(
     }
 
     // 配置文件
-    if let Some(ref p) = cfg.game_path {
+    if let Some(p) = &cfg.game_path {
         if p.exists() {
             return Ok(p.clone());
         }
-        eprintln!("[!] 配置中的路径已失效: {}", p.display());
+        warn!("配置中的路径已失效: {}", p.display());
     }
 
     // 注册表
-    println!("[*] 从注册表查找游戏路径...");
+    info!("从注册表查找游戏路径...");
     if let Some(p) = config::find_game_path_from_registry() {
-        println!("[+] 注册表找到: {}", p.display());
+        info!("注册表找到: {}", p.display());
         cfg.game_path = Some(p.clone());
         cfg.save(config_path).ok();
         return Ok(p);
     }
 
     bail!("未找到游戏路径，请通过 --game-path 指定")
-}
-
-/// 错误时自动终止挂起进程的 guard
-struct ProcessGuard {
-    handle: windows_sys::Win32::Foundation::HANDLE,
-    suppressed: bool,
-}
-
-impl ProcessGuard {
-    fn new(handle: windows_sys::Win32::Foundation::HANDLE) -> Self {
-        Self {
-            handle,
-            suppressed: false,
-        }
-    }
-    /// 标记为成功，Drop 时不终止进程
-    fn suppress(&mut self) {
-        self.suppressed = true;
-    }
-}
-
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        if !self.suppressed {
-            unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(self.handle, 1);
-            }
-        }
-    }
 }
