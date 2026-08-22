@@ -2,7 +2,8 @@
 //!
 //! - 挂起进程创建（RAII，Drop 自动清理）
 //! - 远程进程内存读写
-//! - DLL 注入：`CreateRemoteThread` 执行 `kernel32!LoadLibraryW`，线程退出码即模块基址
+//! - DLL 注入：iced-x86 生成 shellcode 执行 `kernel32!LoadLibraryW` 并回写 64 位基址，
+//!   由公开 API `CreateRemoteThread` 驱动
 
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
@@ -190,13 +191,10 @@ pub fn write_process_memory(process: HANDLE, base_addr: usize, data: &[u8]) -> R
 
 /// 将 DLL 注入到（挂起）进程中，返回 DLL 加载基址
 ///
-/// 流程：远程分配路径/结果/shellcode 缓冲 → 生成执行 `kernel32!LoadLibraryW` 并回写
-/// 64 位基址的 shellcode（iced-x86 汇编）→ `CreateRemoteThread` 执行 → 等待完成 → 读基址
+/// 流程：解析 `LoadLibraryW` 地址 → 远程分配路径/结果/shellcode 缓冲 →
+/// 生成注入 shellcode（[`build_inject_shellcode`]）→ 远程执行（[`execute_remote_code`]）→
+/// 读取回写的 64 位基址
 pub fn inject_dll(process: HANDLE, dll_path: &str) -> Result<usize> {
-    use iced_x86::code_asm::*;
-    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtectEx};
-    use windows_sys::Win32::System::Threading::{CreateRemoteThread, WaitForSingleObject};
-
     // 1. 解析 LoadLibraryW 地址（系统 DLL 在全部进程中基址一致，直接取本机即可）
     let load_library = kernel32_symbol("LoadLibraryW").context("获取 LoadLibraryW 地址失败")?;
 
@@ -206,27 +204,72 @@ pub fn inject_dll(process: HANDLE, dll_path: &str) -> Result<usize> {
     let code_mem = RemoteAlloc::new(process, 0x1000)?;
     write_process_memory(process, path_mem.ptr, &utf16_bytes(dll_path))?;
 
-    // 3. 生成 shellcode：call LoadLibraryW(path)，将 64 位返回值写回结果缓冲
-    let mut asm = CodeAssembler::new(64).unwrap();
-    asm.sub(rsp, 0x28).unwrap(); // 影子空间 + 栈对齐
-    asm.mov(rcx, path_mem.ptr as u64).unwrap(); // LoadLibraryW 参数：路径指针
-    asm.mov(rax, load_library as u64).unwrap();
-    asm.call(rax).unwrap();
-    asm.mov(rbx, result_mem.ptr as u64).unwrap();
-    asm.mov(qword_ptr(rbx), rax).unwrap(); // 回写 HMODULE（64 位，避免线程退出码截断）
-    asm.add(rsp, 0x28).unwrap();
-    asm.ret().unwrap();
-    let code = asm.assemble(0u64).unwrap();
+    // 3. 生成注入 shellcode 并在目标进程内执行
+    let code = build_inject_shellcode(path_mem.ptr, load_library, result_mem.ptr)?;
+    execute_remote_code(process, code_mem.ptr, &code)?;
+
+    // 4. 读取 shellcode 回写的 64 位基址（线程退出码仅 32 位，不能由其获取）
+    let result = read_process_memory(process, result_mem.ptr, 8)?;
+    let base = u64::from_le_bytes(result.try_into().unwrap()) as usize;
+    if base == 0 {
+        bail!("LoadLibraryW 加载 DLL 失败");
+    }
+    info!("DLL 加载基址: 0x{:X}", base);
+    Ok(base)
+}
+
+/// 生成 DLL 注入 shellcode：`call LoadLibraryW(path)`，将 64 位 HMODULE 回写结果缓冲
+///
+/// 汇编逻辑（由 iced-x86 汇编生成，避免手写机器码）：
+/// ```asm
+/// sub rsp, 0x28        ; 影子空间 + 栈对齐
+/// mov rcx, path        ; LoadLibraryW 参数：路径指针
+/// mov rax, LoadLibraryW
+/// call rax
+/// mov rbx, result
+/// mov [rbx], rax       ; 回写 64 位基址
+/// add rsp, 0x28
+/// ret
+/// ```
+fn build_inject_shellcode(
+    path_addr: usize,
+    load_library_addr: usize,
+    result_addr: usize,
+) -> Result<Vec<u8>> {
+    use iced_x86::code_asm::*;
+
+    let mut asm = asm_result(CodeAssembler::new(64))?;
+    asm_result(asm.sub(rsp, 0x28))?; // 影子空间 + 栈对齐
+    asm_result(asm.mov(rcx, path_addr as u64))?;
+    asm_result(asm.mov(rax, load_library_addr as u64))?;
+    asm_result(asm.call(rax))?;
+    asm_result(asm.mov(rbx, result_addr as u64))?;
+    asm_result(asm.mov(qword_ptr(rbx), rax))?; // 回写 64 位基址
+    asm_result(asm.add(rsp, 0x28))?;
+    asm_result(asm.ret())?;
+    let code = asm_result(asm.assemble(0u64))?;
     debug!("远程 shellcode 长度: {}", code.len());
+    Ok(code)
+}
 
-    write_process_memory(process, code_mem.ptr, &code)?;
+/// 便捷错误转换：将汇编生成错误包装为 anyhow 错误
+fn asm_result<T, E: std::fmt::Display>(e: Result<T, E>) -> Result<T> {
+    e.map_err(|err| anyhow::anyhow!("生成 shellcode 失败: {err}"))
+}
 
-    // 4. 将 shellcode 内存改为可执行
+/// 在目标进程内写入 shellcode 并创建远程线程执行，等待执行完成
+fn execute_remote_code(process: HANDLE, code_addr: usize, code: &[u8]) -> Result<()> {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtectEx};
+    use windows_sys::Win32::System::Threading::{CreateRemoteThread, WaitForSingleObject};
+
+    write_process_memory(process, code_addr, code)?;
+
+    // 将 shellcode 内存改为可执行
     let mut old_protect = 0u32;
     let ok = unsafe {
         VirtualProtectEx(
             process,
-            code_mem.ptr as *mut _,
+            code_addr as *mut _,
             0x1000,
             PAGE_EXECUTE_READWRITE,
             &mut old_protect,
@@ -236,9 +279,9 @@ pub fn inject_dll(process: HANDLE, dll_path: &str) -> Result<usize> {
         bail!("VirtualProtectEx 失败: {}", std::io::Error::last_os_error());
     }
 
-    // 5. 创建远程线程执行 shellcode
+    // 创建远程线程执行 shellcode（挂起状态仅影响主线程，新线程可正常调度）
     type ThreadStart = unsafe extern "system" fn(*mut c_void) -> u32;
-    let remote_fn: ThreadStart = unsafe { std::mem::transmute(code_mem.ptr) };
+    let remote_fn: ThreadStart = unsafe { std::mem::transmute(code_addr) };
     let mut thread_id = 0u32;
     let thread = unsafe {
         CreateRemoteThread(
@@ -259,17 +302,10 @@ pub fn inject_dll(process: HANDLE, dll_path: &str) -> Result<usize> {
     }
     let thread = OwnedHandle(thread);
 
-    // 6. 等待加载完成并读取 64 位基址
     if unsafe { WaitForSingleObject(thread.0, 30000) } != 0 {
         bail!("等待注入线程超时");
     }
-    let result = read_process_memory(process, result_mem.ptr, 8)?;
-    let base = u64::from_le_bytes(result.try_into().unwrap()) as usize;
-    if base == 0 {
-        bail!("LoadLibraryW 加载 DLL 失败");
-    }
-    info!("DLL 加载基址: 0x{:X}", base);
-    Ok(base)
+    Ok(())
 }
 
 /// 解析 kernel32 导出符号地址（`GetModuleHandleW` + `GetProcAddress`）

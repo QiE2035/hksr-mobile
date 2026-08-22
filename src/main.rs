@@ -7,6 +7,7 @@
 mod cli;
 mod config;
 mod inject;
+mod process;
 mod win;
 
 use anyhow::{Context, Result, bail};
@@ -53,7 +54,10 @@ fn run(args: &cli::Args) -> Result<()> {
     let game_path = resolve_game_path(args, &mut cfg, &config_path)?;
     info!("游戏路径: {}", game_path.display());
 
-    // 3. 创建挂起进程（RAII：出错自动终止，防止残留挂起的游戏进程）
+    // 3. 检测现有 StarRail 进程并询问是否终止（上次被强杀可能残留挂起进程）
+    process::prompt_kill_game_processes()?;
+
+    // 4. 创建挂起进程（RAII：出错自动终止，防止残留挂起的游戏进程）
     info!("启动游戏进程（挂起）...");
     let mut process = win::SuspendedProcess::create(&game_path)?;
     info!("进程已创建 (PID: {})", process.pid());
