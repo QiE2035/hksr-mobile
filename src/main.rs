@@ -65,7 +65,13 @@ fn run(args: &cli::Args) -> Result<()> {
     // 5. 解析 PE 头，定位 il2cpp 节
     info!("解析 PE 头...");
     let header = win::read_process_memory(handle, ga_base, 0x1000)?;
-    let pe = goblin::pe::PE::parse(&header).context("解析 PE 头失败")?;
+    // 只关心 PE 头与节区表：import 目录的数据超出 0x1000 头部范围，关闭其解析
+    // （否则 goblin 会按文件偏移读取越界报错）；其余数据目录为可选解析，
+    // 宽松模式下解析失败仅告警不中断
+    let opts = goblin::pe::options::ParseOptions::default()
+        .with_parse_mode(goblin::pe::options::ParseMode::Permissive)
+        .with_parse_imports(false);
+    let pe = goblin::pe::PE::parse_with_opts(&header, &opts).context("解析 PE 头失败")?;
     let size_of_image = pe
         .header
         .optional_header
