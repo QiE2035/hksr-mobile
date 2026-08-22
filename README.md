@@ -33,6 +33,7 @@ hksr-mobile.exe --game-path "E:\...\StarRail.exe"
 
 - `--game-path`：直接指定游戏 exe 路径（优先级最高，命中后自动回写配置文件）
 - `--config`：指定配置文件路径（缺省为当前目录下的 `hksr-mobile.toml`）
+- `-v`（`--verbose`）：显示调试日志（ntdll 解析等诊断信息）
 
 游戏路径解析顺序：命令行参数 > 配置文件 > 注册表（CN 服 `miHoYo\HYP`，Global 服 `Cognosphere\HYP`）。
 
