@@ -32,6 +32,9 @@ fn init_logger(verbose: bool) {
         } else {
             log::LevelFilter::Info
         })
+        // goblin 对超出头部范围的可选数据目录（debug/reloc/load config 等）
+        // 在宽松模式下会打印容错 WARN，属预期行为，静音以免干扰
+        .filter_module("goblin", log::LevelFilter::Error)
         .format_timestamp(None)
         .format_target(false)
         .init();
@@ -90,7 +93,7 @@ fn run(args: &cli::Args) -> Result<()> {
     let il2cpp = pe
         .sections
         .iter()
-        .find(|s| &s.name[..] == b"il2cpp" || &s.name[..] == b".il2cpp")
+        .find(|s| s.name.starts_with(b"il2cpp") || s.name.starts_with(b".il2cpp"))
         .context("未找到 il2cpp 节区")?;
 
     let rva = il2cpp.virtual_address as usize;
