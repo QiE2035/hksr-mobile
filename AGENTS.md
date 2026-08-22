@@ -12,6 +12,12 @@ cargo run -- --game-path "E:\...\StarRail.exe"
 
 运行时需管理员权限（`CreateProcessW` 注入）。游戏必须由本工具启动，不能手动启动后附加。
 
+## CI 与版本号
+
+- 工作流 `.github/workflows/ci.yml`：推送到 `master` / `dev` / `simplify-inject` 与 PR 触发；`cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` + Debug/Release 双构建
+- 构建产物经 upload-artifact 保留 30 天（`hksr-mobile-<版本>-x64`）；推送 `v*` 标签时发布 GitHub Release
+- 版本区分：CI 构建 = `<基础版本>-ci.<sha7>`（写入 Cargo.toml 后编译）；本地 dev = 基础版本；release = 标签号（如 `v0.1.0` → `0.1.0`）
+
 ## 架构
 
 - `src/main.rs` — 入口流程：初始化日志（env_logger，`-v` 开 Debug）→ 解析 CLI → 加载配置 → 解析游戏路径（CLI > 配置文件 > 注册表）→ 检测游戏进程并询问清理 → 创建挂起进程 → 注入 DLL → goblin 解析 PE 头 → 找 il2cpp 节 → pattern scan 写值 → 恢复线程

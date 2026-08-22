@@ -24,6 +24,12 @@ cargo build --release  # Release
 
 产物：`target\release\hksr-mobile.exe`
 
+## 版本号约定
+
+- 基础版本在 `Cargo.toml`（当前 `0.1.0`）；本地 `cargo build`（dev）产物即基础版本
+- CI 构建自动注入 `0.1.0-ci.<commit 前 7 位>`，产物作为 Actions artifact 保留 30 天
+- 推送 `v*` 标签触发 GitHub Release（如 `v0.1.0`），exe 随 Release 页发布
+
 ## 使用
 
 游戏必须由本工具启动（不支持手动启动后附加），运行需管理员权限。
