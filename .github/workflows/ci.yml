@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [master, dev, simplify-inject]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # 版本号区分：tag(v*) = release 标签号；普通构建 = <基础版本>-ci.<sha>
+      - name: 确定版本号
+        shell: pwsh
+        run: |
+          $base = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          if ($env:GITHUB_REF -match '^refs/tags/v(.+)$') {
+            $version = $Matches[1]
+          } else {
+            $version = "$base-ci.$($env:GITHUB_SHA.Substring(0,7))"
+          }
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "VERSION=$version`n")
+          Write-Output "基础版本: $base, 本次构建版本: $version"
+
+      - name: 注入构建版本
+        shell: pwsh
+        run: |
+          $content = Get-Content Cargo.toml -Raw
+          $content = $content -replace '^version = "[^"]+"', "version = `"$env:VERSION`""
+          Set-Content Cargo.toml $content -NoNewline
+
+      - name: 格式检查
+        run: cargo fmt --check
+
+      - name: Clippy（零警告）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 构建 Debug
+        run: cargo build
+
+      - name: 构建 Release
+        run: cargo build --release
+
+      - name: 上传构建产物（保留 30 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: hksr-mobile-${{ env.VERSION }}-x64
+          path: target/release/hksr-mobile.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布 GitHub Release（仅 tag 触发）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/hksr-mobile.exe
+          fail_on_unmatched_files: true
