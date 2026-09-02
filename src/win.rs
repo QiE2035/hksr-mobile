@@ -5,24 +5,26 @@
 //! - DLL 注入：iced-x86 生成 shellcode 执行 `kernel32!LoadLibraryW` 并回写 64 位基址，
 //!   由公开 API `CreateRemoteThread` 驱动
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, info, warn};
 use std::ffi::c_void;
 use std::path::Path;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
-    TerminateProcess,
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+use windows::Win32::System::Threading::{
+    CREATE_SUSPENDED, CreateProcessW, CreateRemoteThread, LPTHREAD_START_ROUTINE,
+    PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
+use windows::core::{PCSTR, PCWSTR, PWSTR};
 
 /// RAII 句柄包装：Drop 时自动 `CloseHandle`
 pub struct OwnedHandle(pub HANDLE);
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-            unsafe { CloseHandle(self.0) };
+        // HANDLE::is_invalid 同时覆盖空指针与 INVALID_HANDLE_VALUE
+        if !self.0.is_invalid() {
+            let _ = unsafe { CloseHandle(self.0) };
         }
     }
 }
@@ -40,28 +42,28 @@ pub struct SuspendedProcess {
 impl SuspendedProcess {
     /// 以挂起状态（`CREATE_SUSPENDED`）启动游戏进程
     pub fn create(game_path: &Path) -> Result<Self> {
-        let path_wide = to_wide_string(game_path.to_str().context("路径包含无效 Unicode")?);
-        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
-        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut path_wide = to_wide_string(game_path.to_str().context("路径包含无效 Unicode")?);
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
 
-        let ret = unsafe {
+        unsafe {
             CreateProcessW(
-                std::ptr::null(),
-                path_wide.as_ptr() as *mut u16,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                0,
+                PCWSTR::null(),
+                Some(PWSTR(path_wide.as_mut_ptr())),
+                None,
+                None,
+                false,
                 CREATE_SUSPENDED,
-                std::ptr::null_mut(),
-                std::ptr::null(),
+                None,
+                PCWSTR::null(),
                 &si,
                 &mut pi,
             )
-        };
-        if ret == 0 {
-            bail!("CreateProcessW 失败: {}", std::io::Error::last_os_error());
         }
+        .map_err(|e| anyhow!("CreateProcessW 失败: {e}"))?;
 
         Ok(Self {
             process: OwnedHandle(pi.hProcess),
@@ -96,7 +98,7 @@ impl Drop for SuspendedProcess {
     fn drop(&mut self) {
         if !self.resumed {
             warn!("启动流程中断，终止挂起的游戏进程 (PID: {})", self.pid);
-            unsafe { TerminateProcess(self.process.0, 1) };
+            let _ = unsafe { TerminateProcess(self.process.0, 1) };
         }
     }
 }
@@ -111,13 +113,13 @@ pub struct RemoteAlloc {
 impl RemoteAlloc {
     /// 在目标进程内分配可读写内存
     pub fn new(process: HANDLE, size: usize) -> Result<Self> {
-        use windows_sys::Win32::System::Memory::{
+        use windows::Win32::System::Memory::{
             MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx,
         };
         let ptr = unsafe {
             VirtualAllocEx(
                 process,
-                std::ptr::null_mut(),
+                None,
                 size,
                 MEM_COMMIT | MEM_RESERVE,
                 PAGE_READWRITE,
@@ -135,8 +137,8 @@ impl RemoteAlloc {
 
 impl Drop for RemoteAlloc {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFreeEx};
-        unsafe { VirtualFreeEx(self.process, self.ptr as *mut _, 0, MEM_RELEASE) };
+        use windows::Win32::System::Memory::{MEM_RELEASE, VirtualFreeEx};
+        let _ = unsafe { VirtualFreeEx(self.process, self.ptr as *mut _, 0, MEM_RELEASE) };
     }
 }
 
@@ -145,22 +147,16 @@ pub fn read_process_memory(process: HANDLE, base_addr: usize, size: usize) -> Re
     let mut buf = vec![0u8; size];
     let mut bytes_read = 0usize;
 
-    let ret = unsafe {
+    unsafe {
         ReadProcessMemory(
             process,
             base_addr as *const _,
             buf.as_mut_ptr() as *mut _,
             size,
-            &mut bytes_read,
+            Some(&mut bytes_read),
         )
-    };
-    if ret == 0 {
-        bail!(
-            "ReadProcessMemory 失败 (addr=0x{:X}): {}",
-            base_addr,
-            std::io::Error::last_os_error()
-        );
     }
+    .map_err(|e| anyhow!("ReadProcessMemory 失败 (addr=0x{:X}): {e}", base_addr))?;
 
     buf.truncate(bytes_read);
     Ok(buf)
@@ -170,22 +166,16 @@ pub fn read_process_memory(process: HANDLE, base_addr: usize, size: usize) -> Re
 pub fn write_process_memory(process: HANDLE, base_addr: usize, data: &[u8]) -> Result<()> {
     let mut bytes_written = 0usize;
 
-    let ret = unsafe {
+    unsafe {
         WriteProcessMemory(
             process,
             base_addr as *const _,
             data.as_ptr() as *const _,
             data.len(),
-            &mut bytes_written,
+            Some(&mut bytes_written),
         )
-    };
-    if ret == 0 {
-        bail!(
-            "WriteProcessMemory 失败 (addr=0x{:X}): {}",
-            base_addr,
-            std::io::Error::last_os_error()
-        );
     }
+    .map_err(|e| anyhow!("WriteProcessMemory 失败 (addr=0x{:X}): {e}", base_addr))?;
     Ok(())
 }
 
@@ -259,50 +249,36 @@ fn asm_result<T, E: std::fmt::Display>(e: Result<T, E>) -> Result<T> {
 
 /// 在目标进程内写入 shellcode 并创建远程线程执行，等待执行完成
 fn execute_remote_code(process: HANDLE, code_addr: usize, code: &[u8]) -> Result<()> {
-    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtectEx};
-    use windows_sys::Win32::System::Threading::{CreateRemoteThread, WaitForSingleObject};
+    use windows::Win32::System::Memory::{
+        PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, VirtualProtectEx,
+    };
 
     write_process_memory(process, code_addr, code)?;
 
     // 将 shellcode 内存改为可执行
-    let mut old_protect = 0u32;
-    let ok = unsafe {
+    let mut old_protect = PAGE_PROTECTION_FLAGS(0);
+    unsafe {
         VirtualProtectEx(
             process,
-            code_addr as *mut _,
+            code_addr as *const _,
             0x1000,
             PAGE_EXECUTE_READWRITE,
             &mut old_protect,
         )
-    };
-    if ok == 0 {
-        bail!("VirtualProtectEx 失败: {}", std::io::Error::last_os_error());
     }
+    .map_err(|e| anyhow!("VirtualProtectEx 失败: {e}"))?;
 
     // 创建远程线程执行 shellcode（挂起状态仅影响主线程，新线程可正常调度）
     type ThreadStart = unsafe extern "system" fn(*mut c_void) -> u32;
-    let remote_fn: ThreadStart = unsafe { std::mem::transmute(code_addr) };
+    let remote_fn: LPTHREAD_START_ROUTINE =
+        Some(unsafe { std::mem::transmute::<usize, ThreadStart>(code_addr) });
     let mut thread_id = 0u32;
-    let thread = unsafe {
-        CreateRemoteThread(
-            process,
-            std::ptr::null_mut(),
-            0,
-            Some(remote_fn),
-            std::ptr::null_mut(),
-            0,
-            &mut thread_id,
-        )
-    };
-    if thread.is_null() {
-        bail!(
-            "CreateRemoteThread 失败: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    let thread =
+        unsafe { CreateRemoteThread(process, None, 0, remote_fn, None, 0, Some(&mut thread_id)) }
+            .map_err(|e| anyhow!("CreateRemoteThread 失败: {e}"))?;
     let thread = OwnedHandle(thread);
 
-    if unsafe { WaitForSingleObject(thread.0, 30000) } != 0 {
+    if unsafe { WaitForSingleObject(thread.0, 30000) } != WAIT_OBJECT_0 {
         bail!("等待注入线程超时");
     }
     Ok(())
@@ -315,15 +291,14 @@ fn kernel32_symbol(name: &str) -> Option<usize> {
 
 /// 解析指定模块导出符号地址
 fn module_symbol(module: &str, name: &str) -> Option<usize> {
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
-    let handle = unsafe { GetModuleHandleW(to_wide_string(module).as_ptr()) };
-    if handle.is_null() {
+    let Ok(handle) = (unsafe { GetModuleHandleW(PCWSTR(to_wide_string(module).as_ptr())) }) else {
         return None;
-    }
+    };
     let mut symbol = name.as_bytes().to_vec();
     symbol.push(0); // null 结尾
-    unsafe { GetProcAddress(handle, symbol.as_ptr()) }.map(|f| f as usize)
+    unsafe { GetProcAddress(handle, PCSTR(symbol.as_ptr())) }.map(|f| f as usize)
 }
 
 /// 将 `&str` 转为 null 结尾的 UTF-16 字节序列（小端）

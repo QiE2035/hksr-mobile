@@ -5,7 +5,7 @@
 use anyhow::{Result, bail};
 use log::info;
 use memchr::memchr;
-use windows_sys::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::HANDLE;
 
 use crate::win;
 

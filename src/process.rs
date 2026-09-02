@@ -4,14 +4,15 @@
 //! 覆盖场景：上次运行被强杀（Ctrl+C / taskkill）残留的挂起进程，
 //! 以及用户手动打开的游戏实例（终止前需要用户确认）。
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow};
 use log::info;
 use std::path::Path;
-use windows_sys::Win32::System::ProcessStatus::EnumProcesses;
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
-    TerminateProcess,
+use windows::Win32::System::ProcessStatus::EnumProcesses;
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess,
 };
+use windows::core::PWSTR;
 
 use crate::win::OwnedHandle;
 
@@ -20,9 +21,8 @@ pub fn find_game_processes(game_path: &Path) -> Result<Vec<u32>> {
     // 一次性查询全部进程 PID（数组不够时按返回值截断，Windows 下足够容纳）
     let mut pids = vec![0u32; 4096];
     let mut needed = 0u32;
-    if unsafe { EnumProcesses(pids.as_mut_ptr(), (pids.len() * 4) as u32, &mut needed) } == 0 {
-        bail!("EnumProcesses 失败: {}", std::io::Error::last_os_error());
-    }
+    unsafe { EnumProcesses(pids.as_mut_ptr(), (pids.len() * 4) as u32, &mut needed) }
+        .map_err(|e| anyhow!("EnumProcesses 失败: {e}"))?;
     pids.truncate(needed as usize / 4);
 
     let mut found = Vec::new();
@@ -72,15 +72,23 @@ pub fn prompt_kill_game_processes(game_path: &Path) -> Result<()> {
 
 /// 判断 PID 进程的完整路径是否与配置的游戏路径一致（大小写不敏感，防御 PID 复用）
 fn is_matching_process(pid: u32, game_path: &Path) -> bool {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
         return false;
-    }
+    };
     let _guard = OwnedHandle(handle);
 
     let mut buf = [0u16; 1024];
     let mut len = buf.len() as u32;
-    if unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) } == 0 {
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .is_ok();
+    if !ok {
         return false;
     }
     let exe_path = String::from_utf16_lossy(&buf[..len as usize]);
@@ -89,11 +97,9 @@ fn is_matching_process(pid: u32, game_path: &Path) -> bool {
 
 /// 强制终止指定 PID 的进程
 fn terminate(pid: u32) -> bool {
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }) else {
         return false;
-    }
+    };
     let _guard = OwnedHandle(handle);
-    let ok = unsafe { TerminateProcess(handle, 1) };
-    ok != 0
+    unsafe { TerminateProcess(handle, 1) }.is_ok()
 }

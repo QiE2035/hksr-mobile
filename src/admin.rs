@@ -4,12 +4,13 @@
 //! 若游戏以管理员权限启动（或需要更高权限），启动器必须以管理员身份运行。
 //! 非管理员时通过 `ShellExecuteExW` + `runas` 以管理员身份重启自身。
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use log::info;
-use windows_sys::Win32::UI::Shell::{
+use windows::Win32::UI::Shell::{
     IsUserAnAdmin, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::core::PCWSTR;
 
 use crate::win::to_wide_string;
 
@@ -17,7 +18,7 @@ use crate::win::to_wide_string;
 ///
 /// `IsUserAnAdmin` 返回非零表示调用进程属于管理员组且令牌已提权。
 pub fn is_admin() -> bool {
-    unsafe { IsUserAnAdmin() != 0 }
+    unsafe { IsUserAnAdmin() }.as_bool()
 }
 
 /// 若当前非管理员，则通过 UAC 弹窗以管理员身份重启自身并退出当前进程
@@ -38,21 +39,20 @@ pub fn ensure_admin(self_exe: &str, args: &[String]) -> Result<()> {
     let file = to_wide_string(self_exe);
     let param = params.as_deref().map(to_wide_string);
 
-    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    info.fMask = SEE_MASK_NOCLOSEPROCESS;
-    info.lpVerb = verb.as_ptr();
-    info.lpFile = file.as_ptr();
-    info.lpParameters = param
-        .as_ref()
-        .map(|p| p.as_ptr())
-        .unwrap_or(std::ptr::null());
-    info.nShow = SW_SHOWNORMAL;
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: param
+            .as_ref()
+            .map(|p| PCWSTR(p.as_ptr()))
+            .unwrap_or(PCWSTR::null()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
 
-    let ok = unsafe { ShellExecuteExW(&mut info) };
-    if ok == 0 {
-        bail!("UAC 提权失败: {}", std::io::Error::last_os_error());
-    }
+    unsafe { ShellExecuteExW(&mut info) }.map_err(|e| anyhow!("UAC 提权失败: {e}"))?;
 
     // 提权实例已拉起，当前进程退出，避免与提权实例重复执行注入
     info!("已触发 UAC 提权，退出当前未提权进程");
